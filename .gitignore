@@ -1,0 +1,141 @@
+# ----------------------------------------------------------------------------
+# Sabi .gitignore
+# Keep the repo to source, config and docs. Models, secrets, dependencies,
+# build output and generated audio stay on your machine.
+# ----------------------------------------------------------------------------
+
+# --- Voice models and the Python environment (never commit these) -----------
+# Whisper weights, Piper voices, and the piper-venv that npm run models:install creates.
+server/.models/
+piper-venv/
+*.onnx
+*.onnx.json
+*.bin
+*.safetensors
+*.gguf
+*.ckpt
+*.pt
+*.pth
+
+# Piper and Whisper caches, and partial downloads
+*.tmp
+.cache/
+.npm/
+.huggingface/
+
+# --- Secrets and local configuration -----------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.netrc
+.git-credentials
+
+# --- Dependencies -------------------------------------------------------------
+node_modules/
+.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/releases
+!.yarn/plugins
+!.yarn/sdks
+!.yarn/versions
+.npm
+
+# --- Build output and caches ---------------------------------------------------
+dist/
+dist-ssr/
+build/
+out/
+coverage/
+.vite/
+.vitest/
+.parcel-cache/
+.eslint-cache/
+.oxlintcache
+*.tsbuildinfo
+.turbo/
+.next/
+.nuxt/
+.svelte-kit/
+
+# --- Python ------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# --- Logs and runtime output ---------------------------------------------------
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+logs/
+
+# --- Generated audio and test artefacts ---------------------------------------
+# Local recordings and synthesised test clips. Not part of the project.
+samples/
+*.wav
+*.mp3
+*.ogg
+*.opus
+*.flac
+*.aac
+*.m4a
+*.aiff
+/roundtrip.wav
+/tts-test.wav
+playwright-report/
+test-results/
+blob-report/
+.playwright/
+
+# --- Local tooling state --------------------------------------------------------
+.superpowers/
+.claude/
+.arena/
+
+# --- Editors and IDEs ----------------------------------------------------------
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/launch.json
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+*.sublime-workspace
+
+# --- Operating system ----------------------------------------------------------
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# --- Uploads and scratch -------------------------------------------------------
+uploads/
+scratch/
+tmp/
+temp/
+*.bak
+*.orig
+*.rej
