@@ -1,0 +1,20 @@
+{
+  "laugh": [
+    "laugh/laugh-1.wav"
+  ],
+  "cough": [
+    "cough/cough-1.wav",
+    "cough/cough-2.wav",
+    "cough/cough-3.wav"
+  ],
+  "gasp": [
+    "gasp/gasp-1.wav"
+  ],
+  "yawn": [
+    "yawn/yawn-1.wav",
+    "yawn/yawn-2.wav"
+  ],
+  "sniffle": [
+    "sniffle/sniffle-1.wav"
+  ]
+}

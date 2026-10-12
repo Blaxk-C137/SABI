@@ -6,7 +6,7 @@ import { Keyboard, Mic, MicOff, Settings2, Square } from 'lucide-react'
 import { TutorOrb } from '@/components/tutor/tutor-orb'
 import { MathText } from '@/components/md/math-text'
 import { Whiteboard } from '@/components/classroom/whiteboard'
-import { parseTutorPayload, parseTutorSteps } from '@/lib/gemini/board'
+import { displayText, parseTutorPayload, parseTutorSteps, stableReplyPrefix } from '@/lib/gemini/board'
 import { SetupHarness } from '@/components/harness/setup-harness'
 import { SettingsDrawer } from '@/components/studio/settings-drawer'
 import { Button } from '@/components/ui/button'
@@ -15,7 +15,7 @@ import { useToast } from '@/components/ui/toast'
 import { useAppState } from '@/lib/store'
 import { streamTutorReply, type GeminiTurn } from '@/lib/gemini/tutor'
 import { cancelSpeech, speakSession, stopTutorVoice, subscribeVoiceFrames } from '@/lib/voice/tutor-speak'
-import { playReply, silentPauseMs } from '@/lib/voice/reply-player'
+import { createStepQueue, playReply, silentPauseMs, type StepQueue } from '@/lib/voice/reply-player'
 import { transcribeWithWhisper } from '@/lib/voice/whisper'
 import { describeAsrProgress, getHealth, type AsrInfo } from '@/lib/api'
 import { startMicMonitor } from '@/lib/voice/mic-monitor'
@@ -23,6 +23,16 @@ import { explainError } from '@/lib/debug'
 import type { VoiceState } from '@/lib/voice/types'
 import { cn } from '@/lib/utils'
 import type { IntegrityMode } from '@/lib/course/types'
+
+/** One reply being spoken. Its steps arrive from the stream and are played as they come. */
+interface ReplyRun {
+  session: string
+  live: boolean
+  timers: Set<() => void>
+  queue: StepQueue
+  /** How many of the reply's steps have been handed to the queue. */
+  pushed: number
+}
 
 gsap.registerPlugin(useGSAP)
 
@@ -49,7 +59,7 @@ export function Studio() {
   const [err, setErr] = useState<string | null>(null)
   const [dropOver, setDropOver] = useState(false)
   const [board, setBoard] = useState<{ key: string; title: string; lines: string[]; shown: number } | null>(null)
-  const replyRef = useRef<{ session: string; live: boolean; timers: Set<() => void> } | null>(null)
+  const replyRef = useRef<ReplyRun | null>(null)
   const [asrInfo, setAsrInfo] = useState<AsrInfo | null>(null)
   const [transcribing, setTranscribing] = useState(false)
   // Resolved against the server's list, so a stale saved id can never be sent
@@ -115,66 +125,82 @@ export function Studio() {
   const showBoard = board !== null
   const caption = lineCaption || payload.speech
 
-  // Stop the reply: cancels its speech session, its pauses, and its walk.
+  // Stop the reply: cancels its speech session, its pauses, its walk, and any
+  // steps still to come from the stream.
   const stopReply = useCallback(() => {
     const run = replyRef.current
     replyRef.current = null
     if (!run) return
     run.live = false
+    run.queue.close()
     cancelSpeech(run.session)
     run.timers.forEach((clear) => clear())
     run.timers.clear()
   }, [])
 
-  // Play one reply's steps in written order. The player owns what is spoken
-  // and what the board shows; components only render that state.
-  const startReply = useCallback(
-    (text: string) => {
-      stopReply()
-      setBoard(null)
-      const steps = parseTutorSteps(text)
-      if (steps.length === 0) {
-        setState('idle')
-        return
-      }
-      const run = { session: `reply-${Date.now()}`, live: true, timers: new Set<() => void>() }
-      replyRef.current = run
-      const voice = {
-        voice: settings.ttsVoice || undefined,
-        accent: settings.accent,
-        speed: settings.ttsSpeed,
-      }
-      const pause = (ms: number) =>
-        new Promise<void>((resolve) => {
-          const id = window.setTimeout(resolve, ms)
-          run.timers.add(() => {
-            window.clearTimeout(id)
-            resolve()
-          })
+  // Start a reply that is spoken as it streams. The walk begins at once and waits
+  // for steps; feedReply hands it each sentence or board as the text becomes final.
+  const beginReply = useCallback(() => {
+    stopReply()
+    setBoard(null)
+    const run: ReplyRun = {
+      session: `reply-${Date.now()}`,
+      live: true,
+      timers: new Set<() => void>(),
+      queue: createStepQueue(),
+      pushed: 0,
+    }
+    replyRef.current = run
+    const voice = {
+      voice: settings.ttsVoice || undefined,
+      accent: settings.accent,
+      speed: settings.ttsSpeed,
+    }
+    const pause = (ms: number) =>
+      new Promise<void>((resolve) => {
+        const id = window.setTimeout(resolve, ms)
+        run.timers.add(() => {
+          window.clearTimeout(id)
+          resolve()
         })
-      setState('speaking')
-      void playReply(steps, {
-        cancelled: () => !run.live,
-        speak: (t) => (settings.speak ? speakSession(run.session, t, voice) : pause(silentPauseMs(t))),
-        pause,
-        onStep: (i, step) => {
-          if (step.kind === 'board') {
-            setBoard({ key: `${run.session}-${i}`, title: step.title, lines: step.lines, shown: 0 })
-          }
-        },
-        onLine: (i, shown) =>
-          setBoard((b) => (b && b.key === `${run.session}-${i}` ? { ...b, shown } : b)),
-        onCaption: (c) => setLineCaption(c),
-      }).finally(() => {
-        if (replyRef.current === run) {
-          replyRef.current = null
-          setState('idle')
-          setLineCaption('')
-        }
       })
-    },
-    [settings.speak, settings.ttsVoice, settings.accent, settings.ttsSpeed, stopReply],
-  )
+    // Play one reply's steps in written order. The player owns what is spoken
+    // and what the board shows; components only render that state.
+    void playReply(run.queue.steps, {
+      cancelled: () => !run.live,
+      speak: (t, kind) => (settings.speak ? speakSession(run.session, t, voice, kind) : pause(silentPauseMs(t))),
+      pause,
+      onStep: (i, step) => {
+        setState('speaking')
+        if (step.kind === 'board') {
+          setBoard({ key: `${run.session}-${i}`, title: step.title, lines: step.lines, shown: 0 })
+        }
+      },
+      onLine: (i, shown) =>
+        setBoard((b) => (b && b.key === `${run.session}-${i}` ? { ...b, shown } : b)),
+      onCaption: (c) => setLineCaption(c),
+    }).finally(() => {
+      if (replyRef.current === run) {
+        replyRef.current = null
+        setState('idle')
+        setLineCaption('')
+      }
+    })
+    return run
+  }, [settings.speak, settings.ttsVoice, settings.accent, settings.ttsSpeed, stopReply])
+
+  // Give the walk whatever is final so far: the stable part of a streaming reply,
+  // or the whole reply once the stream has ended.
+  const feedReply = useCallback((run: ReplyRun, raw: string, final: boolean) => {
+    if (replyRef.current !== run || !run.live) return
+    const steps = parseTutorSteps(final ? raw : stableReplyPrefix(raw))
+    for (let i = run.pushed; i < steps.length; i++) run.queue.push(steps[i]!)
+    run.pushed = Math.max(run.pushed, steps.length)
+    if (final) run.queue.close()
+  }, [])
+
+  // Leaving the page silences the tutor.
+  useEffect(() => () => stopReply(), [stopReply])
 
   // Audio levels drive the orb. Throttled so the page does not re-render 60 times a second.
   useEffect(() => {
@@ -217,6 +243,7 @@ export function Studio() {
       const tutorId = `t-${Date.now()}`
       setTurns((t) => [...t, userTurn, { id: tutorId, role: 'tutor', text: '', streaming: true }])
       setState('thinking')
+      const run = beginReply()
       let full = ''
       try {
         for await (const chunk of streamTutorReply({
@@ -232,6 +259,7 @@ export function Studio() {
           files,
         })) {
           full += chunk
+          feedReply(run, full, false)
           const shown = full
           setTurns((t) => t.map((x) => (x.id === tutorId ? { ...x, text: shown } : x)))
         }
@@ -241,8 +269,9 @@ export function Studio() {
           { role: 'model' as const, text: full },
         ].slice(-16)
         setTurns((t) => t.map((x) => (x.id === tutorId ? { ...x, streaming: false, text: full } : x)))
-        startReply(full)
+        feedReply(run, full, true)
       } catch (e) {
+        stopReply()
         const message = explainError(e)
         setErr(message)
         setState('error')
@@ -250,7 +279,7 @@ export function Studio() {
         toast(message)
       }
     },
-    [files, mode, settings, toast, stopReply, startReply],
+    [files, mode, settings, toast, stopReply, beginReply, feedReply],
   )
 
   async function startMic() {
@@ -557,7 +586,7 @@ export function Studio() {
                 <p className="text-[11px] uppercase tracking-[0.16em] text-muted">
                   {t.role === 'tutor' ? 'Amina' : 'You'}
                 </p>
-                <MathText text={t.text} streaming={t.streaming} className="mt-1" />
+                <MathText text={displayText(t.text)} streaming={t.streaming} className="mt-1" />
               </article>
             ))
           )}

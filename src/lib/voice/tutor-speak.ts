@@ -1,4 +1,6 @@
 import { postTts, type TtsRequest } from '@/lib/api'
+import { makeBreath, newNaturalState, planSpeech, speedJitter, type NaturalState } from './natural'
+import { pickReaction, splitReactions } from './reactions'
 
 /**
  * The tutor's voice: one queue for the whole app.
@@ -32,9 +34,18 @@ interface Job {
   cancelled: boolean
   done: () => void
   clip?: Promise<AudioBuffer | null>
+  /** A breath is generated locally, not synthesised. */
+  breath?: boolean
+  /** A human reaction such as "laugh". Plays a recorded clip, or nothing if none is recorded. */
+  reaction?: string
 }
 
 const queue: Job[] = []
+/** Breath and "um" rhythm, kept per reply session so it runs across the whole reply. */
+const rhythm = new Map<string, NaturalState>()
+const breaths = new Map<number, AudioBuffer>()
+let reactionManifest: Promise<Record<string, string[]>> | null = null
+const reactionClips = new Map<string, Promise<AudioBuffer | null>>()
 let current: { job: Job; stop: () => void } | null = null
 let pumping = false
 
@@ -106,6 +117,22 @@ function startFrames() {
   if (!rafId && typeof requestAnimationFrame !== 'undefined') rafId = requestAnimationFrame(frameLoop)
 }
 
+/**
+ * The pause after a clip, in ms. Piper's own pauses are short, so the playback
+ * adds one: longer after a full stop, shorter after a comma, and a little more
+ * for a line that ends without punctuation (a board line).
+ */
+export function clipGapMs(text: string): number {
+  const t = text.trim()
+  if (/[.!?]["')\]]?$/.test(t)) return 420
+  if (/[,;:]$/.test(t)) return 180
+  return 300
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
 /** Split a reply into clips no longer than `max` characters, at sentence and clause edges. */
 export function chunkSpeech(text: string, max = 220): string[] {
   const clean = text.replace(/\s+/g, ' ').trim()
@@ -148,15 +175,50 @@ export function chunkSpeech(text: string, max = 220): string[] {
  * Speak `text` as part of `session`. Resolves when every clip has finished, or
  * when the session is cancelled. Calls for the same session queue up in order.
  */
-export function speakSession(session: string, text: string, opts: SpeakOptions = {}): Promise<void> {
-  const chunks = chunkSpeech(text)
-  if (chunks.length === 0) return Promise.resolve()
-  const done = chunks.map(
-    (chunk) =>
-      new Promise<void>((resolve) => {
-        queue.push({ session, text: chunk, opts, cancelled: false, done: resolve })
-      }),
-  )
+export function speakSession(
+  session: string,
+  text: string,
+  opts: SpeakOptions = {},
+  kind: 'say' | 'line' = 'say',
+): Promise<void> {
+  let state = rhythm.get(session)
+  if (!state) {
+    state = newNaturalState()
+    rhythm.set(session, state)
+  }
+  // Breaths and "um" are planned around the text; each piece is then queued in order.
+  const done: Promise<void>[] = []
+  // Reaction tags split the text. Each run of words gets its own breaths and markers.
+  for (const piece of splitReactions(text)) {
+    if (piece.kind === 'react') {
+      done.push(
+        new Promise<void>((resolve) => {
+          queue.push({ session, text: '', opts, cancelled: false, done: resolve, reaction: piece.name })
+        }),
+      )
+      continue
+    }
+    for (const part of planSpeech(piece.text, kind, state)) {
+      if (part.kind === 'breath') {
+        done.push(
+          new Promise<void>((resolve) => {
+            queue.push({ session, text: '', opts, cancelled: false, done: resolve, breath: true })
+          }),
+        )
+        continue
+      }
+      for (const chunk of chunkSpeech(part.text)) {
+        // Each clip gets its own slight speed, so the voice does not sound metronomic.
+        const clipOpts = { ...opts, speed: speedJitter(opts.speed ?? 1) }
+        done.push(
+          new Promise<void>((resolve) => {
+            queue.push({ session, text: chunk, opts: clipOpts, cancelled: false, done: resolve })
+          }),
+        )
+      }
+    }
+  }
+  if (done.length === 0) return Promise.resolve()
   void pump()
   return Promise.all(done).then(() => undefined)
 }
@@ -164,6 +226,8 @@ export function speakSession(session: string, text: string, opts: SpeakOptions =
 /** Cancel one session, or every session when none is named. */
 export function cancelSpeech(session?: string) {
   const hit = (j: { session: string }) => session === undefined || j.session === session
+  if (session === undefined) rhythm.clear()
+  else rhythm.delete(session)
   for (let i = queue.length - 1; i >= 0; i--) {
     const job = queue[i]!
     if (hit(job)) {
@@ -196,7 +260,7 @@ async function pump() {
       const job = queue.shift()!
       // Fetch the next clip while this one plays.
       const next = queue[0]
-      if (next && !next.clip && !next.cancelled) next.clip = fetchClip(next)
+      if (next && !next.clip && !next.cancelled && !next.breath && !next.reaction) next.clip = fetchClip(next)
       current = { job, stop: () => undefined }
       startFrames()
       try {
@@ -205,6 +269,8 @@ async function pump() {
         console.warn('[sabi] could not play a clip:', e)
       }
       current = null
+      // A breath between clips, so sentences do not run together. Cancelled clips skip it.
+      if (!job.cancelled) await delay(job.breath ? 60 : job.reaction ? 120 : clipGapMs(job.text))
       job.done()
     }
   } finally {
@@ -226,6 +292,16 @@ async function fetchClip(job: Job): Promise<AudioBuffer | null> {
 
 async function playJob(job: Job): Promise<void> {
   if (job.cancelled) return
+  if (job.breath) {
+    const audio = ensureContext()
+    if (audio) await playBuffer(breathBuffer(audio))
+    return
+  }
+  if (job.reaction) {
+    const clip = await reactionClip(job.reaction)
+    if (clip && !job.cancelled) await playBuffer(clip)
+    return
+  }
   const clip = job.clip ?? fetchClip(job)
   job.clip = clip
   const buffer = await clip
@@ -235,6 +311,53 @@ async function playJob(job: Job): Promise<void> {
   } else {
     await playBrowser(job)
   }
+}
+
+/** The reactions manifest, fetched once. If it is missing, every reaction is silent. */
+function loadManifest(): Promise<Record<string, string[]>> {
+  if (!reactionManifest) {
+    reactionManifest = fetch(`${import.meta.env.BASE_URL}reactions/manifest.json`)
+      .then((r) => (r.ok ? (r.json() as Promise<Record<string, string[]>>) : {}))
+      .catch(() => ({}))
+  }
+  return reactionManifest
+}
+
+/** Decode one reaction clip, picked at random from those recorded for it. Cached per file. */
+function reactionClip(name: string): Promise<AudioBuffer | null> {
+  return loadManifest().then((manifest) => {
+    const file = pickReaction(manifest, name)
+    if (!file) return null
+    let clip = reactionClips.get(file)
+    if (!clip) {
+      clip = (async () => {
+        try {
+          const audio = ensureContext()
+          if (!audio) return null
+          const res = await fetch(`${import.meta.env.BASE_URL}reactions/${file}`)
+          if (!res.ok) return null
+          return await audio.decodeAudioData(await res.arrayBuffer())
+        } catch (e) {
+          console.warn('[sabi] could not load reaction', file, e)
+          return null
+        }
+      })()
+      reactionClips.set(file, clip)
+    }
+    return clip
+  })
+}
+
+/** The breath sample for this device's sample rate, made once and reused. */
+function breathBuffer(audio: AudioContext): AudioBuffer {
+  const rate = audio.sampleRate
+  let buf = breaths.get(rate)
+  if (!buf) {
+    buf = audio.createBuffer(1, Math.floor(rate * 0.8), rate)
+    buf.copyToChannel(makeBreath(rate, 0.8), 0)
+    breaths.set(rate, buf)
+  }
+  return buf
 }
 
 function playBuffer(buffer: AudioBuffer): Promise<void> {
